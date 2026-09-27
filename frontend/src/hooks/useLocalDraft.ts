@@ -84,5 +84,6 @@ export const DRAFT_KEYS = {
   matrixNew: 'matrix-new',
   caseEditor: (caseId: string) => `case-${caseId}`,
   defectBoard: 'defect-new',
+  repairBatch: 'repair-batch-new',
   proofNew: 'proof-new',
 } as const;

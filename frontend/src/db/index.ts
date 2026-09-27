@@ -5,8 +5,10 @@ import type { DefectSeverity, DefectType } from '../types/defect';
 import type { MatrixAvailability, MatrixFont, MatrixMaterial, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofRecord } from '../types/proof';
+import type { RepairBatch, RepairBatchItem } from '../types/repair';
+import { suggestRepairBatchCode } from '../types/repair';
 import { matrixIdsOf } from '../utils/layout';
-import { suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
+import { addDays, suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
 
 export const DB_NAME = 'gbmovabletype-db';
 
@@ -15,12 +17,14 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 加 repairBatches（补刻批次）表
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
   cases!: Table<TypeCase, string>;
   defects!: Table<DefectLog, string>;
   proofs!: Table<ProofRecord, string>;
+  repairBatches!: Table<RepairBatch, string>;
 
   constructor() {
     super(DB_NAME);
@@ -78,6 +82,13 @@ class MovableTypeDb extends Dexie {
           });
         }
       });
+    this.version(4).stores({
+      matrices: 'id, code, character, font, sizeName, material, availability',
+      cases: 'id, code, kind, workStation, *matrixId',
+      defects: 'id, matrixId, defectType, severity, availability, foundDate',
+      proofs: 'id, matrixId, sampleNo, clarity, proofDate',
+      repairBatches: 'id, code, status, plannedDate, *matrixIds',
+    });
   }
 }
 
@@ -189,6 +200,7 @@ const SEED_PROOFS: SeedProof[] = [
 
 function buildSeed() {
   const now = new Date().toISOString();
+  const today = now.slice(0, 10);
   const matrices: TypeMatrix[] = SEED_MATRICES.map((m) => ({
     ...m,
     sizePt: ptOfSize(m.sizeName),
@@ -233,7 +245,33 @@ function buildSeed() {
     };
   });
   const proofs: ProofRecord[] = SEED_PROOFS.map((p) => ({ ...p, createdAt: now }));
-  return { matrices, cases, defects, proofs };
+  const seedBatchIds = ['m-1005', 'm-1014'];
+  const batchItems: RepairBatchItem[] = seedBatchIds.map((id) => {
+    const m = matrices.find((x) => x.id === id)!;
+    return {
+      matrixId: m.id,
+      character: m.character,
+      matrixCode: m.code,
+      availability: m.availability,
+      addedAt: now,
+    };
+  });
+  const repairBatches: RepairBatch[] = [
+    {
+      id: 'rb-4001',
+      code: suggestRepairBatchCode(today, 1),
+      owner: '周介庵',
+      plannedDate: addDays(today, 7),
+      note: '受潮变形与断裂字模集中补刻，完成后整盘复测',
+      status: '进行中',
+      items: batchItems,
+      matrixIds: seedBatchIds,
+      completedDate: '',
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+  return { matrices, cases, defects, proofs, repairBatches };
 }
 
 let seedPromise: Promise<void> | null = null;
@@ -242,12 +280,21 @@ async function doSeed(): Promise<void> {
   const count = await db.matrices.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.matrices, db.cases, db.defects, db.proofs, async () => {
-    await db.matrices.bulkPut(seed.matrices);
-    await db.cases.bulkPut(seed.cases);
-    await db.defects.bulkPut(seed.defects);
-    await db.proofs.bulkPut(seed.proofs);
-  });
+  await db.transaction(
+    'rw',
+    db.matrices,
+    db.cases,
+    db.defects,
+    db.proofs,
+    db.repairBatches,
+    async () => {
+      await db.matrices.bulkPut(seed.matrices);
+      await db.cases.bulkPut(seed.cases);
+      await db.defects.bulkPut(seed.defects);
+      await db.proofs.bulkPut(seed.proofs);
+      await db.repairBatches.bulkPut(seed.repairBatches);
+    },
+  );
 }
 
 /** 首次打开时写入示例档案；已有数据则跳过。并发调用共享同一个 Promise。 */
@@ -270,4 +317,4 @@ export async function countByAvailability(): Promise<Record<string, number>> {
   return out;
 }
 
-export { suggestMatrixCode, suggestCaseCode };
+export { suggestMatrixCode, suggestCaseCode, suggestRepairBatchCode };

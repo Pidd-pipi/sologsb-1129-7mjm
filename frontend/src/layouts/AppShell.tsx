@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useCaseStore } from '../stores/caseStore';
 import { useMatrixStore } from '../stores/matrixStore';
+import { useRepairStore } from '../stores/repairStore';
 import { useUiStore } from '../stores/uiStore';
 
 const NAV = [
@@ -30,12 +31,16 @@ export default function AppShell() {
     (s) => s.matrices.filter((m) => m.availability === '待补刻').length,
   );
   const caseCount = useCaseStore((s) => s.cases.length);
+  const activeBatchCount = useRepairStore(
+    (s) => s.batches.filter((b) => b.status === '进行中').length,
+  );
   const toast = useUiStore((s) => s.toast);
   const clearToast = useUiStore((s) => s.clearToast);
 
   useEffect(() => {
     void loadMatrices();
     void loadCases();
+    void useRepairStore.getState().load();
   }, [loadMatrices, loadCases]);
 
   useEffect(() => {
@@ -92,6 +97,9 @@ export default function AppShell() {
             </span>
             <span className="mt-chip border-brass/40 text-brass" data-testid="count-repair">
               待补刻 {repairCount}
+            </span>
+            <span className="mt-chip border-brass/40 text-brass" data-testid="count-active-batch">
+              补刻批次 {activeBatchCount}
             </span>
           </div>
         </div>

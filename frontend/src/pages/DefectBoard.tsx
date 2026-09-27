@@ -2,8 +2,15 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import DefectBadge from '../components/common/DefectBadge';
 import EmptyState from '../components/common/EmptyState';
+import RepairBatchCard from '../components/common/RepairBatchCard';
 import { DRAFT_KEYS, useLocalDraft } from '../hooks/useLocalDraft';
 import { useMatrixStore } from '../stores/matrixStore';
+import {
+  RepairBatchConflictError,
+  selectBusyMatrixIds,
+  useRepairStore,
+  type BatchConflict,
+} from '../stores/repairStore';
 import { useUiStore } from '../stores/uiStore';
 import {
   DEFECT_SEVERITIES,
@@ -39,20 +46,45 @@ const INITIAL_FORM: DefectFormState = {
   note: '',
 };
 
-/** `/defects` 缺损登记：提交后自动停用字模并进入待补刻清单 */
+interface BatchDraft {
+  selectedIds: string[];
+  owner: string;
+  plannedDate: string;
+  note: string;
+}
+
+const INITIAL_BATCH_DRAFT: BatchDraft = {
+  selectedIds: [],
+  owner: '',
+  plannedDate: todayStr(),
+  note: '',
+};
+
+/** `/defects` 缺损登记：登记缺损、勾选多枚字模建立补刻批次、整批完成恢复可用 */
 export default function DefectBoard() {
   const matrices = useMatrixStore((s) => s.matrices);
   const defects = useMatrixStore((s) => s.defects);
   const addDefect = useMatrixStore((s) => s.addDefect);
   const repairMatrix = useMatrixStore((s) => s.repairMatrix);
+  const batches = useRepairStore((s) => s.batches);
+  const createBatch = useRepairStore((s) => s.createBatch);
+  const completeBatch = useRepairStore((s) => s.completeBatch);
+  const removeBatchItems = useRepairStore((s) => s.removeBatchItems);
   const pushToast = useUiStore((s) => s.pushToast);
 
   const { draft, patch, reset, savedAt, existed } = useLocalDraft<DefectFormState>(
     DRAFT_KEYS.defectBoard,
     INITIAL_FORM,
   );
+  const batchDraft = useLocalDraft<BatchDraft>(DRAFT_KEYS.repairBatch, INITIAL_BATCH_DRAFT);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [batchErrors, setBatchErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
+  const [creatingBatch, setCreatingBatch] = useState(false);
+  const [completingId, setCompletingId] = useState('');
+  const [removingId, setRemovingId] = useState('');
+  /** 每个批次当前待处理的冲突列表（整批完成被拦下后展示） */
+  const [conflictMap, setConflictMap] = useState<Record<string, BatchConflict[]>>({});
 
   useEffect(() => {
     if (!draft.matrixId && matrices.length > 0) patch({ matrixId: matrices[0].id });
@@ -67,6 +99,36 @@ export default function DefectBoard() {
         ),
     [matrices],
   );
+
+  /** 进行中批次占用的字模 id，待补刻清单中这些字模不可勾选 */
+  const busyIds = useMemo(() => selectBusyMatrixIds(batches), [batches]);
+  const selectedSet = useMemo(() => new Set(batchDraft.draft.selectedIds), [batchDraft.draft.selectedIds]);
+
+  // 清理勾选中的失效项：已被恢复 / 删除 / 已进入其它进行中批次的字模自动移出草稿
+  const selectedIds = batchDraft.draft.selectedIds;
+  const patchBatchDraft = batchDraft.patch;
+  useEffect(() => {
+    const pendingIds = new Set(pendingRepair.map((m) => m.id));
+    const next = selectedIds.filter((id) => pendingIds.has(id) && !busyIds.has(id));
+    if (next.length !== selectedIds.length) {
+      patchBatchDraft({ selectedIds: next });
+    }
+  }, [pendingRepair, busyIds, selectedIds, patchBatchDraft]);
+
+  const toggleSelected = (id: string) => {
+    const next = selectedSet.has(id)
+      ? batchDraft.draft.selectedIds.filter((x) => x !== id)
+      : [...batchDraft.draft.selectedIds, id];
+    batchDraft.patch({ selectedIds: next });
+    setBatchErrors((e) => {
+      if (!e.matrixIds) return e;
+      const { matrixIds: _omit, ...rest } = e;
+      return rest;
+    });
+  };
+
+  const activeBatches = useMemo(() => batches.filter((b) => b.status === '进行中'), [batches]);
+  const doneBatches = useMemo(() => batches.filter((b) => b.status === '已完成'), [batches]);
 
   const latestDefectOf = (matrixId: string) =>
     [...defects]
@@ -117,6 +179,85 @@ export default function DefectBoard() {
     }
   };
 
+  const handleCreateBatch = async (e: FormEvent) => {
+    e.preventDefault();
+    const input = {
+      matrixIds: batchDraft.draft.selectedIds,
+      owner: batchDraft.draft.owner,
+      plannedDate: batchDraft.draft.plannedDate,
+      note: batchDraft.draft.note,
+    };
+    const next: Record<string, string> = {};
+    if (input.matrixIds.length === 0) next.matrixIds = '请至少勾选一枚字模';
+    if (!input.owner.trim()) next.owner = '请填写负责人';
+    if (!input.plannedDate.trim()) next.plannedDate = '请填写计划完成日期';
+    setBatchErrors(next);
+    if (Object.keys(next).length > 0) {
+      pushToast('补刻批次信息未填完整，请按提示修正', 'warn');
+      return;
+    }
+    setCreatingBatch(true);
+    try {
+      const row = await createBatch(input);
+      pushToast(`已建立补刻批次 ${row.code}，共 ${row.items.length} 枚字模`);
+      batchDraft.reset();
+      setBatchErrors({});
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '建立补刻批次失败', 'error');
+    } finally {
+      setCreatingBatch(false);
+    }
+  };
+
+  const handleCompleteBatch = async (batchId: string, operator: string) => {
+    setCompletingId(batchId);
+    try {
+      await completeBatch(batchId, operator);
+      setConflictMap((m) => {
+        const { [batchId]: _omit, ...rest } = m;
+        return rest;
+      });
+      const batch = batches.find((b) => b.id === batchId);
+      pushToast(`批次 ${batch?.code ?? ''} 整批完成，${batch?.items.length ?? 0} 枚字模已恢复可用`);
+    } catch (err) {
+      if (err instanceof RepairBatchConflictError) {
+        setConflictMap((m) => ({ ...m, [batchId]: err.conflicts }));
+        pushToast('整批完成已停下：有字模被单独恢复，请先处理冲突', 'warn');
+      } else {
+        pushToast(err instanceof Error ? err.message : '整批完成失败', 'error');
+      }
+    } finally {
+      setCompletingId('');
+    }
+  };
+
+  const handleRemoveConflicts = async (batchId: string) => {
+    const conflicts = conflictMap[batchId] ?? [];
+    setRemovingId(batchId);
+    try {
+      await removeBatchItems(
+        batchId,
+        conflicts.map((c) => c.matrixId),
+      );
+      const batch = batches.find((b) => b.id === batchId);
+      const stillBusy = batch ? batch.items.length - conflicts.length : 0;
+      setConflictMap((m) => {
+        const { [batchId]: _omit, ...rest } = m;
+        return rest;
+      });
+      pushToast(
+        stillBusy > 0
+          ? `已移出 ${conflicts.length} 枚冲突字模，剩余 ${stillBusy} 枚可再次整批完成`
+          : `已移出全部 ${conflicts.length} 枚冲突字模，批次已清空并关闭`,
+        'warn',
+      );
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '移出冲突字模失败', 'error');
+    } finally {
+      setRemovingId('');
+    }
+  };
+
   return (
     <div className="space-y-4">
       <section className="flex flex-wrap items-end justify-between gap-3">
@@ -125,7 +266,7 @@ export default function DefectBoard() {
             缺损登记
           </h2>
           <p className="mt-sub">
-            选字模与缺损类型、程度，提交后字模自动停用并进入待补刻清单；补刻完成后可一键恢复可用。
+            选字模与缺损类型、程度，提交后字模自动停用并进入待补刻清单；可勾选多枚字模建立补刻批次，整批完成后一起恢复可用。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -134,6 +275,9 @@ export default function DefectBoard() {
           </span>
           <span className="mt-chip border-seal/40 text-seal" data-testid="defect-pending">
             待处理 {pendingRepair.length} 枚
+          </span>
+          <span className="mt-chip border-brass/40 text-brass" data-testid="active-batch-count">
+            进行中批次 {activeBatches.length} 个
           </span>
         </div>
       </section>
@@ -315,11 +459,11 @@ export default function DefectBoard() {
         </form>
       </section>
 
-      <section className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_1.2fr]">
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-[1.25fr_1fr]">
         <div className="mt-panel">
           <div className="mt-panel-head">
             <h3 className="font-song text-sm font-semibold text-ink">待补刻清单</h3>
-            <span className="mt-sub">补刻完成后恢复可用</span>
+            <span className="mt-sub">勾选多枚字模建立批次；已在未完成批次中的字模不可重复选择</span>
           </div>
           {pendingRepair.length === 0 ? (
             <div className="px-4 py-4">
@@ -329,40 +473,60 @@ export default function DefectBoard() {
             <ul className="divide-y divide-paper-line" data-testid="pending-list">
               {pendingRepair.map((m) => {
                 const d = latestDefectOf(m.id);
+                const inBatch = busyIds.has(m.id);
+                const checked = selectedSet.has(m.id);
                 return (
                   <li key={m.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-song text-lg text-ink">{m.character}</span>
-                        <span className="text-[11px] text-ink-mute">{m.code}</span>
-                        <span className="mt-chip">{m.availability}</span>
+                    <div className="flex items-start gap-2">
+                      <input
+                        type="checkbox"
+                        className="mt-1 h-4 w-4 accent-[#a8352a]"
+                        data-testid={`pending-check-${m.id}`}
+                        checked={checked}
+                        disabled={inBatch}
+                        onChange={() => toggleSelected(m.id)}
+                        aria-label={`勾选字模 ${m.character}`}
+                      />
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-song text-lg text-ink">{m.character}</span>
+                          <span className="text-[11px] text-ink-mute">{m.code}</span>
+                          <span className="mt-chip">{m.availability}</span>
+                          {inBatch ? (
+                            <span className="mt-chip border-brass/50 bg-brass-pale text-brass" data-testid={`pending-inbatch-${m.id}`}>
+                              已在批次中
+                            </span>
+                          ) : null}
+                        </div>
+                        {d ? (
+                          <DefectBadge
+                            type={d.defectType}
+                            severity={d.severity}
+                            testId={`pending-defect-${m.id}`}
+                          />
+                        ) : (
+                          <span className="text-[11px] text-ink-mute">暂无缺损记录</span>
+                        )}
+                        {d ? <p className="text-[11px] text-ink-soft">{d.handling}</p> : null}
                       </div>
-                      {d ? (
-                        <DefectBadge
-                          type={d.defectType}
-                          severity={d.severity}
-                          testId={`pending-defect-${m.id}`}
-                        />
-                      ) : (
-                        <span className="text-[11px] text-ink-mute">暂无缺损记录</span>
-                      )}
-                      {d ? <p className="text-[11px] text-ink-soft">{d.handling}</p> : null}
                     </div>
                     <div className="flex items-center gap-2">
                       <Link className="mt-btn" to={`/matrices/${m.id}`} data-testid={`pending-detail-${m.id}`}>
                         查看详情
                       </Link>
-                      <button
-                        type="button"
-                        className="mt-btn mt-btn-primary"
-                        data-testid={`repair-${m.id}`}
-                        onClick={async () => {
-                          await repairMatrix(m.id, draft.operator || '补刻工 陈之安');
-                          pushToast(`「${m.character}」补刻完成，恢复可用`);
-                        }}
-                      >
-                        补刻完成
-                      </button>
+                      {!inBatch ? (
+                        <button
+                          type="button"
+                          className="mt-btn mt-btn-primary"
+                          data-testid={`repair-${m.id}`}
+                          onClick={async () => {
+                            await repairMatrix(m.id, draft.operator || '补刻工 陈之安');
+                            pushToast(`「${m.character}」补刻完成，恢复可用`);
+                          }}
+                        >
+                          单独补刻完成
+                        </button>
+                      ) : null}
                     </div>
                   </li>
                 );
@@ -373,53 +537,232 @@ export default function DefectBoard() {
 
         <div className="mt-panel">
           <div className="mt-panel-head">
-            <h3 className="font-song text-sm font-semibold text-ink">缺损记录</h3>
-            <span className="mt-sub">按登记时间倒序</span>
+            <h3 className="font-song text-sm font-semibold text-ink">建立补刻批次</h3>
+            <span className="mt-sub" data-testid="batch-draft-status">
+              已勾选 {batchDraft.draft.selectedIds.length} 枚
+            </span>
           </div>
-          <div className="overflow-x-auto">
-            <table className="min-w-full" data-testid="defect-table">
-              <thead className="border-b border-paper-line bg-paper/60">
+          <form className="space-y-3 px-4 py-4" onSubmit={handleCreateBatch} data-testid="batch-form">
+            {batchDraft.draft.selectedIds.length > 0 ? (
+              <div className="flex flex-wrap gap-1.5" data-testid="batch-selected-preview">
+                {batchDraft.draft.selectedIds.map((id) => {
+                  const m = matrices.find((x) => x.id === id);
+                  if (!m) return null;
+                  return (
+                    <span key={id} className="mt-chip border-brass/40">
+                      <span className="font-song text-sm">{m.character}</span>
+                      <button
+                        type="button"
+                        className="text-ink-mute hover:text-seal"
+                        data-testid={`batch-unselect-${id}`}
+                        onClick={() => toggleSelected(id)}
+                        aria-label={`取消勾选 ${m.character}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-[11px] text-ink-mute" data-testid="batch-selected-empty">
+                请在左侧待补刻清单中勾选字模（已在未完成批次中的字模不可勾选）。
+              </p>
+            )}
+            {batchErrors.matrixIds ? (
+              <p className="mt-error" data-testid="error-batch-matrixIds">
+                {batchErrors.matrixIds}
+              </p>
+            ) : null}
+            <div>
+              <label className="mt-label" htmlFor="batch-owner-input">
+                负责人
+              </label>
+              <input
+                id="batch-owner-input"
+                data-testid="batch-owner-input"
+                className="mt-input"
+                placeholder="例：补刻师傅 周介庵"
+                value={batchDraft.draft.owner}
+                onChange={(e) => batchDraft.patch({ owner: e.target.value })}
+              />
+              {batchErrors.owner ? (
+                <p className="mt-error" data-testid="error-batch-owner">
+                  {batchErrors.owner}
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <label className="mt-label" htmlFor="batch-planned-input">
+                计划完成日期
+              </label>
+              <input
+                id="batch-planned-input"
+                data-testid="batch-planned-input"
+                type="date"
+                className="mt-input"
+                value={batchDraft.draft.plannedDate}
+                onChange={(e) => batchDraft.patch({ plannedDate: e.target.value })}
+              />
+              {batchErrors.plannedDate ? (
+                <p className="mt-error" data-testid="error-batch-planned">
+                  {batchErrors.plannedDate}
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <label className="mt-label" htmlFor="batch-note-input">
+                批次备注
+              </label>
+              <input
+                id="batch-note-input"
+                data-testid="batch-note-input"
+                className="mt-input"
+                placeholder="例：受潮变形字模集中补刻，完成后整盘复测"
+                value={batchDraft.draft.note}
+                onChange={(e) => batchDraft.patch({ note: e.target.value })}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="submit"
+                className="mt-btn mt-btn-primary"
+                data-testid="submit-batch"
+                disabled={creatingBatch}
+              >
+                {creatingBatch ? '建立中…' : '建立补刻批次'}
+              </button>
+              <button
+                type="button"
+                className="mt-btn"
+                data-testid="reset-batch-draft"
+                onClick={() => {
+                  batchDraft.reset();
+                  setBatchErrors({});
+                }}
+              >
+                清空勾选
+              </button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div className="mt-panel">
+          <div className="mt-panel-head">
+            <h3 className="font-song text-sm font-semibold text-ink">进行中的补刻批次</h3>
+            <span className="mt-sub">整批完成时字模一起恢复可用</span>
+          </div>
+          {activeBatches.length === 0 ? (
+            <div className="px-4 py-4">
+              <EmptyState
+                title="没有进行中的补刻批次"
+                description="在待补刻清单勾选多枚字模，填写负责人与计划日期即可建批。"
+                testId="active-batch-empty"
+              />
+            </div>
+          ) : (
+            <ul className="divide-y divide-paper-line" data-testid="active-batch-list">
+              {activeBatches.map((b) => (
+                <RepairBatchCard
+                  key={b.id}
+                  batch={b}
+                  conflicts={conflictMap[b.id] ?? []}
+                  completing={completingId === b.id}
+                  removing={removingId === b.id}
+                  onComplete={(operator) => handleCompleteBatch(b.id, operator)}
+                  onDismissConflict={() =>
+                    setConflictMap((m) => {
+                      const { [b.id]: _omit, ...rest } = m;
+                      return rest;
+                    })
+                  }
+                  onRemoveConflicts={() => handleRemoveConflicts(b.id)}
+                  testId={`active-batch-${b.id}`}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="mt-panel">
+          <div className="mt-panel-head">
+            <h3 className="font-song text-sm font-semibold text-ink">已完成的补刻批次</h3>
+            <span className="mt-sub">收尾记录可在各字模缺损历史中查看</span>
+          </div>
+          {doneBatches.length === 0 ? (
+            <div className="px-4 py-4">
+              <EmptyState title="暂无已完成批次" description="整批完成的补刻批次会归档到这里。" testId="done-batch-empty" />
+            </div>
+          ) : (
+            <ul className="divide-y divide-paper-line" data-testid="done-batch-list">
+              {doneBatches.map((b) => (
+                <RepairBatchCard
+                  key={b.id}
+                  batch={b}
+                  conflicts={[]}
+                  completing={false}
+                  removing={false}
+                  onComplete={() => undefined}
+                  onDismissConflict={() => undefined}
+                  onRemoveConflicts={() => undefined}
+                  testId={`done-batch-${b.id}`}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      </section>
+
+      <section className="mt-panel">
+        <div className="mt-panel-head">
+          <h3 className="font-song text-sm font-semibold text-ink">缺损记录</h3>
+          <span className="mt-sub">按登记时间倒序</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full" data-testid="defect-table">
+            <thead className="border-b border-paper-line bg-paper/60">
+              <tr>
+                <th className="mt-th">字模</th>
+                <th className="mt-th">类型 / 程度</th>
+                <th className="mt-th">发现日期</th>
+                <th className="mt-th">处理方式</th>
+                <th className="mt-th">登记人</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-paper-line">
+              {sortedDefects.length === 0 ? (
                 <tr>
-                  <th className="mt-th">字模</th>
-                  <th className="mt-th">类型 / 程度</th>
-                  <th className="mt-th">发现日期</th>
-                  <th className="mt-th">处理方式</th>
-                  <th className="mt-th">登记人</th>
+                  <td className="mt-td text-ink-mute" colSpan={5}>
+                    暂无缺损记录。
+                  </td>
                 </tr>
-              </thead>
-              <tbody className="divide-y divide-paper-line">
-                {sortedDefects.length === 0 ? (
-                  <tr>
-                    <td className="mt-td text-ink-mute" colSpan={5}>
-                      暂无缺损记录。
+              ) : (
+                sortedDefects.map((d) => (
+                  <tr key={d.id} data-testid={`defect-row-${d.id}`}>
+                    <td className="mt-td">
+                      <Link className="font-song text-base text-ink hover:text-seal" to={`/matrices/${d.matrixId}`}>
+                        {d.character}
+                      </Link>
+                      <div className="text-[11px] text-ink-mute">{dash(d.matrixCode)}</div>
                     </td>
+                    <td className="mt-td">
+                      <DefectBadge
+                        type={d.defectType}
+                        severity={d.severity}
+                        availability={d.availability}
+                        testId={`defect-row-badge-${d.id}`}
+                      />
+                    </td>
+                    <td className="mt-td">{formatDate(d.foundDate)}</td>
+                    <td className="mt-td">{d.handling}</td>
+                    <td className="mt-td">{dash(d.operator)}</td>
                   </tr>
-                ) : (
-                  sortedDefects.map((d) => (
-                    <tr key={d.id} data-testid={`defect-row-${d.id}`}>
-                      <td className="mt-td">
-                        <Link className="font-song text-base text-ink hover:text-seal" to={`/matrices/${d.matrixId}`}>
-                          {d.character}
-                        </Link>
-                        <div className="text-[11px] text-ink-mute">{dash(d.matrixCode)}</div>
-                      </td>
-                      <td className="mt-td">
-                        <DefectBadge
-                          type={d.defectType}
-                          severity={d.severity}
-                          availability={d.availability}
-                          testId={`defect-row-badge-${d.id}`}
-                        />
-                      </td>
-                      <td className="mt-td">{formatDate(d.foundDate)}</td>
-                      <td className="mt-td">{d.handling}</td>
-                      <td className="mt-td">{dash(d.operator)}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       </section>
     </div>
