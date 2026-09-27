@@ -38,6 +38,7 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 | TypeMatrix 字模 | `src/types/matrix.ts` | 字模编号、字符、字体（宋体/楷体/仿宋）、字号（初号 42pt … 八号 5pt 共 16 档）、材质（铜模/木活字/铅合金）、字面尺寸 mm、字身高度 mm、制作年代、刻工、可用性 |
 | TypeCase 字盘 | `src/types/case.ts` | 字盘编号、类型（常用字盘/生僻字盘）、行数、列数、格位布局（行/列/字符/字模 id）、所在工位、容量 |
 | DefectLog 缺损记录 | `src/types/defect.ts` | 字模 id、缺损类型（缺笔/磨损/变形/锈蚀/断裂）、程度（轻/中/重）、发现日期、处理方式、可用性（可用/停用/待补刻） |
+| RepairBatch 补刻批次 | `src/types/repairBatch.ts` | 批次编号（BK-日期-序号）、字模条目（含 *matrixIds 多值索引）、负责人、计划日期、状态（进行中/已完成）、完成人/完成日期 |
 | ProofRecord 试印记录 | `src/types/proof.ts` | 字符或字盘、压力 kg、用墨、印次、样张编号、清晰度评价（清晰/偏淡/糊版）、试印日期 |
 
 ### IndexedDB 版本与升级迁移（Dexie）
@@ -45,8 +46,16 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 - **v1**：建 `matrices` 表（含 code / character / font / sizeName / material / availability 索引）
 - **v2**：加 `cases` 表与 `matrixId` 多值索引；升级时按 `slots` 回填历史字盘的 `matrixId`
 - **v3**：加 `defects`、`proofs` 表；升级时为「停用 / 待补刻」的历史字模回填缺损原因记录
+- **v4**：加 `repairBatches` 表（补刻批次，`status` / `plannedDate` / `completedDate` / `*matrixIds` 索引）
 
-首次打开且库为空时会写入一批示例档案（16 枚字模、2 个字盘、5 条缺损、6 条试印），便于直接体验；已有数据则跳过。
+首次打开且库为空时会写入一批示例档案（16 枚字模、2 个字盘、9 条缺损、2 个补刻批次、6 条试印），便于直接体验；已有数据则跳过。
+
+### 补刻批次流程
+
+1. 在「缺损登记 → 待补刻清单」勾选多枚停用 / 待补刻字模（已在进行中批次里的字模会锁定并显示批次号，不能重复选中），填写负责人与计划完成日期后建立批次。
+2. 批次分「进行中」「已完成」两组展示，进行中批次显示负责人、计划日期（逾期高亮）与批次内字模。
+3. 整批完成：批次内全部字模在一个 Dexie 事务里一起恢复可用，并各写一条 `note = 补刻收尾记录` 的缺损记录。
+4. 冲突拦截：提交收尾前若批次内任一字模已被单独恢复（或删除），整批中止并提示冲突；页面会标红冲突项，处理人可「移出冲突项」后对剩余字模再整批完成（全部移出时批次自动收尾）。
 
 ## 页面与路由
 
@@ -56,7 +65,7 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 | `/matrices/new` | `MatrixNew` | 字模登记：字符选择器按部首与笔画校验并给出候选，填写字体、字号、材质、尺寸与年代 |
 | `/matrices/:id` | `MatrixDetail` | 字模详情：字面信息、所在字盘格位、缺损历史、试印记录，可就地新增缺损或试印、补刻恢复可用 |
 | `/cases` | `CaseEditor` | 字盘布局编辑器：行列网格点击落位 / 取出 / 调换，实时提示空格与重复落位 |
-| `/defects` | `DefectBoard` | 缺损登记：提交后自动停用字模并进入待补刻清单，补刻完成一键恢复 |
+| `/defects` | `DefectBoard` | 缺损登记：提交后自动停用字模并进入待补刻清单；可勾选多枚建立补刻批次（负责人/计划日期），整批完成统一恢复可用，冲突时先处理冲突项；进行中与已完成批次分组可见 |
 | `/proofs` | `ProofList` | 试印记录：登记压力、用墨与清晰度，按样张编号回溯试印批次 |
 
 ## 目录结构
@@ -74,11 +83,11 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
     ├── tailwind.config.js / postcss.config.js / vite.config.ts
     ├── public/favicon.svg
     └── src/
-        ├── types/{matrix,case,defect,proof}.ts
+        ├── types/{matrix,case,defect,repairBatch,proof}.ts
         ├── db/index.ts       # Dexie 库、版本迁移、示例档案
         ├── stores/{matrixStore,caseStore,uiStore}.ts
         ├── hooks/{useMatrixSearch,useLocalDraft,useCaseSlots}.ts
-        ├── components/common/{MatrixCell,LayoutGrid,CharacterPicker,DefectBadge,EmptyState}.tsx
+        ├── components/common/{MatrixCell,LayoutGrid,CharacterPicker,DefectBadge,RepairBatchCard,EmptyState}.tsx
         ├── layouts/AppShell.tsx
         ├── pages/{Overview,MatrixNew,MatrixDetail,CaseEditor,DefectBoard,ProofList}.tsx
         ├── router/index.tsx
@@ -87,7 +96,7 @@ docker compose down        # 停止并移除容器（数据在浏览器本地，
 
 ## 数据存储说明
 
-- **业务数据**：IndexedDB（Dexie，库名 `gbmovabletype-db`，共 4 张表 `matrices` / `cases` / `defects` / `proofs`）。写入前统一 `toPlain()` 深拷贝，避免响应式对象写库抛 `DataCloneError`。
+- **业务数据**：IndexedDB（Dexie，库名 `gbmovabletype-db`，共 5 张表 `matrices` / `cases` / `defects` / `proofs` / `repairBatches`）。写入前统一 `toPlain()` 深拷贝，避免响应式对象写库抛 `DataCloneError`。
 - **草稿数据**：localStorage，前缀 `gbmovabletype-draft:`，覆盖字模登记、字盘布局、缺损登记、试印登记四处表单，刷新后可恢复。
 - **界面偏好**：localStorage，键 `gbmovabletype-ui`（Zustand persist，保存筛选条件与当前选中字盘）。
 - 容器完全无状态：不挂载命名卷、不连接数据库服务，删除重建容器不影响浏览器里的档案。

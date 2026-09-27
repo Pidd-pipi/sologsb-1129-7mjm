@@ -48,6 +48,7 @@ export default function MatrixDetail() {
   const addProof = useMatrixStore((s) => s.addProof);
   const repairMatrix = useMatrixStore((s) => s.repairMatrix);
   const removeMatrix = useMatrixStore((s) => s.removeMatrix);
+  const repairBatches = useMatrixStore((s) => s.repairBatches);
   const cases = useCaseStore((s) => s.cases);
   const pushToast = useUiStore((s) => s.pushToast);
 
@@ -61,6 +62,10 @@ export default function MatrixDetail() {
     [proofs, id],
   );
   const holdings = useMemo(() => findCaseHolding(cases, id), [cases, id]);
+  const openBatch = useMemo(
+    () => repairBatches.find((b) => b.status === '进行中' && b.matrixIds.includes(id)),
+    [repairBatches, id],
+  );
 
   const [editing, setEditing] = useState(false);
   const [editForm, setEditForm] = useState({
@@ -226,9 +231,19 @@ export default function MatrixDetail() {
           <span className="mt-chip" data-testid="detail-availability">
             当前状态：{matrix.availability}
           </span>
+          {openBatch ? (
+            <Link
+              className="mt-chip border-brass/40 text-brass hover:bg-brass-pale"
+              to="/defects"
+              data-testid="detail-open-batch"
+              title={`负责人 ${openBatch.owner} · 计划 ${openBatch.plannedDate}`}
+            >
+              补刻批次 {openBatch.code} 进行中
+            </Link>
+          ) : null}
           {matrix.availability !== '可用' ? (
             <button type="button" className="mt-btn mt-btn-primary" data-testid="repair-btn" onClick={handleRepair}>
-              补刻完成，恢复可用
+              单枚补刻完成，恢复可用
             </button>
           ) : null}
           <button

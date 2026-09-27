@@ -5,6 +5,7 @@ import type { DefectSeverity, DefectType } from '../types/defect';
 import type { MatrixAvailability, MatrixFont, MatrixMaterial, TypeMatrix } from '../types/matrix';
 import { ptOfSize } from '../types/matrix';
 import type { ProofRecord } from '../types/proof';
+import type { RepairBatch } from '../types/repairBatch';
 import { matrixIdsOf } from '../utils/layout';
 import { suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
 
@@ -15,12 +16,14 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 加 repairBatches 表（补刻批次，多枚字模统一补刻、整批收尾）
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
   cases!: Table<TypeCase, string>;
   defects!: Table<DefectLog, string>;
   proofs!: Table<ProofRecord, string>;
+  repairBatches!: Table<RepairBatch, string>;
 
   constructor() {
     super(DB_NAME);
@@ -78,6 +81,13 @@ class MovableTypeDb extends Dexie {
           });
         }
       });
+    this.version(4).stores({
+      matrices: 'id, code, character, font, sizeName, material, availability',
+      cases: 'id, code, kind, workStation, *matrixId',
+      defects: 'id, matrixId, defectType, severity, availability, foundDate',
+      proofs: 'id, matrixId, sampleNo, clarity, proofDate',
+      repairBatches: 'id, code, status, plannedDate, completedDate, *matrixIds',
+    });
   }
 }
 
@@ -162,6 +172,10 @@ const SEED_DEFECTS: SeedDefect[] = [
   { id: 'dft-2003', matrixId: 'm-1005', defectType: '变形', severity: '轻', foundDate: '2025-02-11', handling: '木活字受潮轻微变形，阴干后复测仍不合格，转待补刻', availability: '待补刻', operator: '周介庵', note: '字面翘曲 0.2mm' },
   { id: 'dft-2004', matrixId: 'm-1014', defectType: '断裂', severity: '重', foundDate: '2025-05-06', handling: '字身底部断裂，停用待重铸', availability: '待补刻', operator: '李墨林', note: '' },
   { id: 'dft-2005', matrixId: 'm-1008', defectType: '锈蚀', severity: '轻', foundDate: '2024-11-20', handling: '铜模表面轻微锈蚀，擦拭除锈后继续使用', availability: '可用', operator: '吴少泉', note: '例行保养记录' },
+  { id: 'dft-2006', matrixId: 'm-1001', defectType: '锈蚀', severity: '中', foundDate: '2026-06-28', handling: '铜模字面边缘锈蚀，停用并入补刻批次 BK-20260710-01', availability: '停用', operator: '陈之安', note: '' },
+  { id: 'dft-2007', matrixId: 'm-1002', defectType: '磨损', severity: '轻', foundDate: '2026-07-02', handling: '铅字字面轻微磨损，统一并入补刻批次 BK-20260710-01', availability: '停用', operator: '陈之安', note: '' },
+  { id: 'dft-2008', matrixId: 'm-1001', defectType: '锈蚀', severity: '中', foundDate: '2026-07-10', handling: '补刻批次 BK-20260710-01：补刻完成，字面复测合格', availability: '可用', operator: '陈之安', note: '补刻收尾记录' },
+  { id: 'dft-2009', matrixId: 'm-1002', defectType: '磨损', severity: '轻', foundDate: '2026-07-10', handling: '补刻批次 BK-20260710-01：补刻完成，字面复测合格', availability: '可用', operator: '陈之安', note: '补刻收尾记录' },
 ];
 
 interface SeedProof {
@@ -185,6 +199,49 @@ const SEED_PROOFS: SeedProof[] = [
   { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
   { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
   { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
+];
+
+interface SeedRepairBatch {
+  id: string;
+  code: string;
+  matrixIds: string[];
+  owner: string;
+  plannedDate: string;
+  note: string;
+  status: '进行中' | '已完成';
+  createdAt: string;
+  completedBy: string;
+  completedAt: string;
+  completedDate: string;
+}
+
+const SEED_REPAIR_BATCHES: SeedRepairBatch[] = [
+  {
+    id: 'rpb-4001',
+    code: 'BK-20260710-01',
+    matrixIds: ['m-1001', 'm-1002'],
+    owner: '陈之安',
+    plannedDate: '2026-07-09',
+    note: '铜 / 铅字模整批复测补刻',
+    status: '已完成',
+    createdAt: '2026-07-03T09:20:00.000Z',
+    completedBy: '陈之安',
+    completedAt: '2026-07-10T16:05:00.000Z',
+    completedDate: '2026-07-10',
+  },
+  {
+    id: 'rpb-4002',
+    code: 'BK-20260920-01',
+    matrixIds: ['m-1005', 'm-1014'],
+    owner: '陈之安',
+    plannedDate: '2026-09-25',
+    note: '木活字「排」与断裂铅字「体」，体字需重铸',
+    status: '进行中',
+    createdAt: '2026-09-20T10:00:00.000Z',
+    completedBy: '',
+    completedAt: '',
+    completedDate: '',
+  },
 ];
 
 function buildSeed() {
@@ -233,7 +290,27 @@ function buildSeed() {
     };
   });
   const proofs: ProofRecord[] = SEED_PROOFS.map((p) => ({ ...p, createdAt: now }));
-  return { matrices, cases, defects, proofs };
+  const repairBatches: RepairBatch[] = SEED_REPAIR_BATCHES.map((b) => {
+    const items = b.matrixIds
+      .map((id) => matrices.find((m) => m.id === id))
+      .filter((m): m is TypeMatrix => Boolean(m))
+      .map((m) => ({ matrixId: m.id, character: m.character, matrixCode: m.code }));
+    return {
+      id: b.id,
+      code: b.code,
+      items,
+      matrixIds: items.map((i) => i.matrixId),
+      owner: b.owner,
+      plannedDate: b.plannedDate,
+      note: b.note,
+      status: b.status,
+      createdAt: b.createdAt,
+      completedBy: b.completedBy,
+      completedAt: b.completedAt,
+      completedDate: b.completedDate,
+    };
+  });
+  return { matrices, cases, defects, proofs, repairBatches };
 }
 
 let seedPromise: Promise<void> | null = null;
@@ -242,12 +319,21 @@ async function doSeed(): Promise<void> {
   const count = await db.matrices.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.matrices, db.cases, db.defects, db.proofs, async () => {
-    await db.matrices.bulkPut(seed.matrices);
-    await db.cases.bulkPut(seed.cases);
-    await db.defects.bulkPut(seed.defects);
-    await db.proofs.bulkPut(seed.proofs);
-  });
+  await db.transaction(
+    'rw',
+    db.matrices,
+    db.cases,
+    db.defects,
+    db.proofs,
+    db.repairBatches,
+    async () => {
+      await db.matrices.bulkPut(seed.matrices);
+      await db.cases.bulkPut(seed.cases);
+      await db.defects.bulkPut(seed.defects);
+      await db.proofs.bulkPut(seed.proofs);
+      await db.repairBatches.bulkPut(seed.repairBatches);
+    },
+  );
 }
 
 /** 首次打开时写入示例档案；已有数据则跳过。并发调用共享同一个 Promise。 */

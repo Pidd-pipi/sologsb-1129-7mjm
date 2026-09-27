@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import DefectBadge from '../components/common/DefectBadge';
 import EmptyState from '../components/common/EmptyState';
+import RepairBatchCard from '../components/common/RepairBatchCard';
 import { DRAFT_KEYS, useLocalDraft } from '../hooks/useLocalDraft';
 import { useMatrixStore } from '../stores/matrixStore';
 import { useUiStore } from '../stores/uiStore';
@@ -15,6 +16,7 @@ import {
   type DefectType,
 } from '../types/defect';
 import { MATRIX_AVAILABILITIES, type MatrixAvailability } from '../types/matrix';
+import type { RepairBatch } from '../types/repairBatch';
 import { countBy, dash, formatDate, todayStr } from '../utils/format';
 
 interface DefectFormState {
@@ -39,12 +41,26 @@ const INITIAL_FORM: DefectFormState = {
   note: '',
 };
 
-/** `/defects` 缺损登记：提交后自动停用字模并进入待补刻清单 */
+interface BatchFormState {
+  owner: string;
+  plannedDate: string;
+  note: string;
+}
+
+const INITIAL_BATCH_FORM: BatchFormState = {
+  owner: '',
+  plannedDate: todayStr(),
+  note: '',
+};
+
+/** `/defects` 缺损登记：提交后自动停用字模并进入待补刻清单；可勾选多枚建立补刻批次整批收尾 */
 export default function DefectBoard() {
   const matrices = useMatrixStore((s) => s.matrices);
   const defects = useMatrixStore((s) => s.defects);
+  const repairBatches = useMatrixStore((s) => s.repairBatches);
   const addDefect = useMatrixStore((s) => s.addDefect);
   const repairMatrix = useMatrixStore((s) => s.repairMatrix);
+  const createRepairBatch = useMatrixStore((s) => s.createRepairBatch);
   const pushToast = useUiStore((s) => s.pushToast);
 
   const { draft, patch, reset, savedAt, existed } = useLocalDraft<DefectFormState>(
@@ -53,6 +69,11 @@ export default function DefectBoard() {
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
+
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [batchForm, setBatchForm] = useState<BatchFormState>(INITIAL_BATCH_FORM);
+  const [batchErrors, setBatchErrors] = useState<Record<string, string>>({});
+  const [creatingBatch, setCreatingBatch] = useState(false);
 
   useEffect(() => {
     if (!draft.matrixId && matrices.length > 0) patch({ matrixId: matrices[0].id });
@@ -67,6 +88,43 @@ export default function DefectBoard() {
         ),
     [matrices],
   );
+
+  const openBatches = useMemo(
+    () => repairBatches.filter((b) => b.status === '进行中'),
+    [repairBatches],
+  );
+  const finishedBatches = useMemo(
+    () => repairBatches.filter((b) => b.status === '已完成'),
+    [repairBatches],
+  );
+
+  /** 字模 id → 所在进行中批次编号（已在未完成批次里的字模不能再次选中） */
+  const lockedBy = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const b of openBatches) {
+      for (const mid of b.matrixIds) if (!map.has(mid)) map.set(mid, b.code);
+    }
+    return map;
+  }, [openBatches]);
+
+  const selectablePending = useMemo(
+    () => pendingRepair.filter((m) => !lockedBy.has(m.id)),
+    [pendingRepair, lockedBy],
+  );
+
+  /** 进行中批次内当前已被单独恢复的字模 id（整批收尾冲突项） */
+  const conflictsOf = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const b of openBatches) {
+      const set = new Set<string>();
+      for (const mid of b.matrixIds) {
+        const m = matrices.find((x) => x.id === mid);
+        if (!m || m.availability === '可用') set.add(mid);
+      }
+      map.set(b.id, set);
+    }
+    return map;
+  }, [openBatches, matrices]);
 
   const latestDefectOf = (matrixId: string) =>
     [...defects]
@@ -117,6 +175,73 @@ export default function DefectBoard() {
     }
   };
 
+  const toggleSelect = (id: string) => {
+    setSelectedIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+  };
+
+  const allSelectableChecked =
+    selectablePending.length > 0 && selectablePending.every((m) => selectedIds.includes(m.id));
+
+  const toggleSelectAll = () => {
+    setSelectedIds((cur) =>
+      allSelectableChecked ? cur.filter((id) => !selectablePending.some((m) => m.id === id)) : selectablePending.map((m) => m.id),
+    );
+  };
+
+  const selectedMatrices = useMemo(
+    () => selectedIds.map((id) => matrices.find((m) => m.id === id)).filter((m): m is NonNullable<typeof m> => Boolean(m)),
+    [selectedIds, matrices],
+  );
+
+  const handleCreateBatch = async (e: FormEvent) => {
+    e.preventDefault();
+    const items = selectedMatrices.map((m) => ({
+      matrixId: m.id,
+      character: m.character,
+      matrixCode: m.code,
+    }));
+    const next: Record<string, string> = {};
+    if (items.length === 0) next.items = '请至少勾选一枚需要补刻的字模';
+    if (!batchForm.owner.trim()) next.owner = '请填写负责人';
+    if (!batchForm.plannedDate.trim()) next.plannedDate = '请填写计划日期';
+    else if (!/^\d{4}-\d{2}-\d{2}$/.test(batchForm.plannedDate)) next.plannedDate = '日期格式需为 YYYY-MM-DD';
+    setBatchErrors(next);
+    if (Object.keys(next).length > 0) {
+      pushToast('补刻批次信息不完整，请按提示修正', 'warn');
+      return;
+    }
+    setCreatingBatch(true);
+    try {
+      const batch = await createRepairBatch({
+        items,
+        owner: batchForm.owner,
+        plannedDate: batchForm.plannedDate,
+        note: batchForm.note,
+      });
+      pushToast(`已建立批次 ${batch.code}，共 ${batch.items.length} 枚字模`);
+      setSelectedIds([]);
+      setBatchForm(INITIAL_BATCH_FORM);
+      setBatchErrors({});
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '建立补刻批次失败', 'error');
+    } finally {
+      setCreatingBatch(false);
+    }
+  };
+
+  const renderBatchList = (list: RepairBatch[], testId: string, emptyText: string) =>
+    list.length === 0 ? (
+      <p className="px-4 py-4 text-xs text-ink-mute" data-testid={`${testId}-empty`}>
+        {emptyText}
+      </p>
+    ) : (
+      <ul className="space-y-2 px-4 py-3" data-testid={testId}>
+        {list.map((b) => (
+          <RepairBatchCard key={b.id} batch={b} conflictIds={conflictsOf.get(b.id) ?? new Set()} testId={`batch-${b.id}`} />
+        ))}
+      </ul>
+    );
+
   return (
     <div className="space-y-4">
       <section className="flex flex-wrap items-end justify-between gap-3">
@@ -125,7 +250,7 @@ export default function DefectBoard() {
             缺损登记
           </h2>
           <p className="mt-sub">
-            选字模与缺损类型、程度，提交后字模自动停用并进入待补刻清单；补刻完成后可一键恢复可用。
+            选字模与缺损类型、程度，提交后字模自动停用并进入待补刻清单；可勾选多枚建立补刻批次，整批完成后统一恢复可用。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -134,6 +259,9 @@ export default function DefectBoard() {
           </span>
           <span className="mt-chip border-seal/40 text-seal" data-testid="defect-pending">
             待处理 {pendingRepair.length} 枚
+          </span>
+          <span className="mt-chip border-brass/40 text-brass" data-testid="batch-open-count">
+            进行中批次 {openBatches.length} 个
           </span>
         </div>
       </section>
@@ -319,7 +447,17 @@ export default function DefectBoard() {
         <div className="mt-panel">
           <div className="mt-panel-head">
             <h3 className="font-song text-sm font-semibold text-ink">待补刻清单</h3>
-            <span className="mt-sub">补刻完成后恢复可用</span>
+            <label className="flex items-center gap-1.5 text-[11px] text-ink-soft" data-testid="select-all-pending">
+              <input
+                type="checkbox"
+                className="mt-check"
+                checked={allSelectableChecked}
+                disabled={selectablePending.length === 0}
+                onChange={toggleSelectAll}
+                data-testid="select-all-pending-input"
+              />
+              全选可选（{selectablePending.length} 枚可勾选）
+            </label>
           </div>
           {pendingRepair.length === 0 ? (
             <div className="px-4 py-4">
@@ -329,24 +467,45 @@ export default function DefectBoard() {
             <ul className="divide-y divide-paper-line" data-testid="pending-list">
               {pendingRepair.map((m) => {
                 const d = latestDefectOf(m.id);
+                const lockedCode = lockedBy.get(m.id);
+                const checked = selectedIds.includes(m.id);
                 return (
                   <li key={m.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-song text-lg text-ink">{m.character}</span>
-                        <span className="text-[11px] text-ink-mute">{m.code}</span>
-                        <span className="mt-chip">{m.availability}</span>
+                    <div className="flex items-start gap-2">
+                      <input
+                        type="checkbox"
+                        className="mt-check mt-1"
+                        checked={checked}
+                        disabled={Boolean(lockedCode)}
+                        onChange={() => toggleSelect(m.id)}
+                        aria-label={`勾选字模 ${m.character}`}
+                        data-testid={`pending-check-${m.id}`}
+                      />
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-song text-lg text-ink">{m.character}</span>
+                          <span className="text-[11px] text-ink-mute">{m.code}</span>
+                          <span className="mt-chip">{m.availability}</span>
+                          {lockedCode ? (
+                            <span
+                              className="mt-chip border-brass/40 text-brass"
+                              data-testid={`pending-locked-${m.id}`}
+                            >
+                              批次 {lockedCode} 进行中
+                            </span>
+                          ) : null}
+                        </div>
+                        {d ? (
+                          <DefectBadge
+                            type={d.defectType}
+                            severity={d.severity}
+                            testId={`pending-defect-${m.id}`}
+                          />
+                        ) : (
+                          <span className="text-[11px] text-ink-mute">暂无缺损记录</span>
+                        )}
+                        {d ? <p className="text-[11px] text-ink-soft">{d.handling}</p> : null}
                       </div>
-                      {d ? (
-                        <DefectBadge
-                          type={d.defectType}
-                          severity={d.severity}
-                          testId={`pending-defect-${m.id}`}
-                        />
-                      ) : (
-                        <span className="text-[11px] text-ink-mute">暂无缺损记录</span>
-                      )}
-                      {d ? <p className="text-[11px] text-ink-soft">{d.handling}</p> : null}
                     </div>
                     <div className="flex items-center gap-2">
                       <Link className="mt-btn" to={`/matrices/${m.id}`} data-testid={`pending-detail-${m.id}`}>
@@ -361,7 +520,7 @@ export default function DefectBoard() {
                           pushToast(`「${m.character}」补刻完成，恢复可用`);
                         }}
                       >
-                        补刻完成
+                        单枚补刻完成
                       </button>
                     </div>
                   </li>
@@ -369,6 +528,104 @@ export default function DefectBoard() {
               })}
             </ul>
           )}
+
+          <form
+            className="space-y-2 border-t border-paper-line bg-paper/40 px-4 py-3"
+            onSubmit={handleCreateBatch}
+            data-testid="batch-create-form"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="font-song text-sm font-semibold text-ink">
+                建立补刻批次{selectedMatrices.length > 0 ? `（已选 ${selectedMatrices.length} 枚）` : ''}
+              </h4>
+              {selectedMatrices.length > 0 ? (
+                <div className="flex flex-wrap gap-1" data-testid="selected-preview">
+                  {selectedMatrices.map((m) => (
+                    <span key={m.id} className="mt-chip border-brass/40 text-brass">
+                      {m.character}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div>
+                <label className="mt-label" htmlFor="batch-owner-input">
+                  负责人
+                </label>
+                <input
+                  id="batch-owner-input"
+                  className="mt-input"
+                  placeholder="例：陈之安"
+                  value={batchForm.owner}
+                  onChange={(e) => setBatchForm((p) => ({ ...p, owner: e.target.value }))}
+                  data-testid="batch-owner-input"
+                />
+                {batchErrors.owner ? (
+                  <p className="mt-error" data-testid="error-batch-owner">
+                    {batchErrors.owner}
+                  </p>
+                ) : null}
+              </div>
+              <div>
+                <label className="mt-label" htmlFor="batch-planned-input">
+                  计划完成日期
+                </label>
+                <input
+                  id="batch-planned-input"
+                  type="date"
+                  className="mt-input"
+                  value={batchForm.plannedDate}
+                  onChange={(e) => setBatchForm((p) => ({ ...p, plannedDate: e.target.value }))}
+                  data-testid="batch-planned-input"
+                />
+                {batchErrors.plannedDate ? (
+                  <p className="mt-error" data-testid="error-batch-planned">
+                    {batchErrors.plannedDate}
+                  </p>
+                ) : null}
+              </div>
+              <div>
+                <label className="mt-label" htmlFor="batch-note-input">
+                  批次备注
+                </label>
+                <input
+                  id="batch-note-input"
+                  className="mt-input"
+                  placeholder="例：本周统一补刻"
+                  value={batchForm.note}
+                  onChange={(e) => setBatchForm((p) => ({ ...p, note: e.target.value }))}
+                  data-testid="batch-note-input"
+                />
+              </div>
+            </div>
+            {batchErrors.items ? (
+              <p className="mt-error" data-testid="error-batch-items">
+                {batchErrors.items}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="submit"
+                className="mt-btn mt-btn-primary"
+                disabled={creatingBatch}
+                data-testid="batch-create-submit"
+              >
+                {creatingBatch ? '建批中…' : '建立补刻批次'}
+              </button>
+              {selectedIds.length > 0 ? (
+                <button
+                  type="button"
+                  className="mt-btn"
+                  onClick={() => setSelectedIds([])}
+                  data-testid="batch-clear-selection"
+                >
+                  清除勾选
+                </button>
+              ) : null}
+              <span className="mt-hint">已在进行中批次里的字模会锁定，不能再次选中</span>
+            </div>
+          </form>
         </div>
 
         <div className="mt-panel">
@@ -420,6 +677,23 @@ export default function DefectBoard() {
               </tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div className="mt-panel">
+          <div className="mt-panel-head">
+            <h3 className="font-song text-sm font-semibold text-ink">进行中的补刻批次</h3>
+            <span className="mt-sub">整批完成后字模一起恢复可用</span>
+          </div>
+          {renderBatchList(openBatches, 'batch-open-list', '暂无进行中的补刻批次，可在上方待补刻清单勾选字模建批。')}
+        </div>
+        <div className="mt-panel">
+          <div className="mt-panel-head">
+            <h3 className="font-song text-sm font-semibold text-ink">已完成的补刻批次</h3>
+            <span className="mt-sub">每枚字模各留一条补刻收尾记录</span>
+          </div>
+          {renderBatchList(finishedBatches, 'batch-finished-list', '暂无已完成的补刻批次。')}
         </div>
       </section>
     </div>

@@ -84,6 +84,12 @@ export function suggestSampleNo(dateStr: string, seq: number): string {
   return `YZ-${compact}-${`${seq}`.padStart(2, '0')}`;
 }
 
+/** 生成补刻批次编号建议，例：BK-20260927-01 */
+export function suggestRepairBatchCode(dateStr: string, seq: number): string {
+  const compact = (dateStr || todayStr()).replace(/-/g, '');
+  return `BK-${compact}-${`${seq}`.padStart(2, '0')}`;
+}
+
 /** 简单文本截断 */
 export function truncate(text: string, len: number): string {
   if (!text) return '';
